@@ -1,6 +1,5 @@
 --============================================================
 --  UL 脚本 · WindUI 版本
---  速度 / 跳跃 / 夜视 / ESP / 自瞄（拉远+指定玩家+NPC+平滑+预测）/ 穿墙 / 隐身 / 主题 / 公告
 --  目标环境：执行器（Executor）
 --============================================================
 
@@ -8,6 +7,7 @@ local Players           = game:GetService("Players")
 local UserInputService  = game:GetService("UserInputService")
 local RunService        = game:GetService("RunService")
 local Lighting          = game:GetService("Lighting")
+local PhysicsService    = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
@@ -47,9 +47,9 @@ local ANNOUNCE = {
         "大家好，这是 UL 脚本阿尔法版本。",
         "这里有 bug 可以反馈，只需要加入群号：（未设定）",
         "自瞄已完善，支持视角自由拉近拉远。",
-        "新增自瞄目标选择，可指定玩家锁定。",
-        "自瞄支持 NPC 目标锁定。",
-        "新增自瞄平滑度与预测值调节。",
+        "新增自瞄目标选择，可指定玩家 / NPC 锁定。",
+        "新增人物无碰撞，别人碰不到你。",
+        "优化自瞄性能，减少卡顿。",
     },
     Titles  = {
         "欢迎",
@@ -57,7 +57,7 @@ local ANNOUNCE = {
         "功能更新",
         "新增功能",
         "新增功能",
-        "新增功能",
+        "性能优化",
     },
 }
 
@@ -65,13 +65,14 @@ local ANNOUNCE = {
 -- 状态
 --============================================================
 local State = {
-    Speed       = 16,
-    Jump        = 50,
-    NightVision = false,
-    ESP         = false,
-    Aimbot      = false,
-    Noclip      = false,
-    Stealth     = false,
+    Speed          = 16,
+    Jump           = 50,
+    NightVision    = false,
+    ESP            = false,
+    Aimbot         = false,
+    Noclip         = false,
+    Stealth        = false,
+    NoPlayerCollide = false,
 }
 
 --============================================================
@@ -278,7 +279,66 @@ local function setNoclip(on)
 end
 
 --============================================================
--- 自瞄（拉远 + 指定玩家 + NPC + 平滑 + 预测）
+-- 人物无碰撞
+--============================================================
+local SELF_GROUP  = "UL_SelfGroup"
+local OTHER_GROUP = "UL_OtherGroup"
+local noPlayerCollideConn = nil
+local collisionGroupsReady = false
+
+local function initCollisionGroups()
+    if collisionGroupsReady then return true end
+    local ok1 = pcall(function() PhysicsService:RegisterCollisionGroup(SELF_GROUP) end)
+    local ok2 = pcall(function() PhysicsService:RegisterCollisionGroup(OTHER_GROUP) end)
+    pcall(function()
+        PhysicsService:CollisionGroupSetCollidable(SELF_GROUP, OTHER_GROUP, false)
+    end)
+    collisionGroupsReady = true
+    return ok1 or ok2
+end
+
+local function setCharGroup(char, group)
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            pcall(function() part.CollisionGroup = group end)
+        end
+    end
+end
+
+local function applyNoPlayerCollide()
+    setCharGroup(player.Character, SELF_GROUP)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            setCharGroup(plr.Character, OTHER_GROUP)
+        end
+    end
+end
+
+local function setNoPlayerCollide(on)
+    State.NoPlayerCollide = on
+    if on then
+        initCollisionGroups()
+        applyNoPlayerCollide()
+        if noPlayerCollideConn then noPlayerCollideConn:Disconnect() end
+        noPlayerCollideConn = RunService.Stepped:Connect(applyNoPlayerCollide)
+    else
+        if noPlayerCollideConn then
+            noPlayerCollideConn:Disconnect()
+            noPlayerCollideConn = nil
+        end
+        -- 还原
+        setCharGroup(player.Character, "Default")
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= player and plr.Character then
+                setCharGroup(plr.Character, "Default")
+            end
+        end
+    end
+end
+
+--============================================================
+-- 自瞄
 --============================================================
 local AIM = {
     ConeRadius     = 260,
@@ -292,15 +352,13 @@ local AIM = {
     Prediction     = 0.15,
 }
 
--- 目标选择
 local AIM_TARGET_AUTO = "自动（最近目标）"
 local AIM_Selected    = AIM_TARGET_AUTO
-local AIM_LockNPC     = true           -- 自动模式是否也锁 NPC
+local AIM_LockNPC     = true
 
--- NPC 缓存
-local npcList  = {}                    -- { { model=, humanoid=, key= } }
-local npcByKey = {}                    -- [key] = entry
-local NPC_MAX  = 40                    -- 下拉列表最多显示多少个 NPC
+local npcList  = {}
+local npcByKey = {}
+local NPC_MAX  = 20    -- [FIX] 40 → 20，减轻每帧检测压力
 
 local function getPartFromChar(char)
     if not char then return nil end
@@ -311,46 +369,65 @@ local function getTargetPart(plr)
     return getPartFromChar(plr.Character)
 end
 
--- [NEW] 扫描 workspace 里的 NPC
-local function scanNPCs()
-    local seen    = {}
-    local newList = {}
-    local newByKey = {}
-    local count   = 0
+-- [FIX] NPC 扫描：异步分批，不再卡主线程
+local function scanNPCsAsync(onDone)
+    task.spawn(function()
+        local seen     = {}
+        local newList  = {}
+        local newByKey = {}
+        local count    = 0
+        local iter     = 0
 
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if count >= NPC_MAX then break end
-        if obj:IsA("Humanoid") and obj.Health > 0 then
-            local model = obj.Parent
-            if model and model:IsA("Model") and not seen[model] then
-                seen[model] = true
-                -- 排除玩家角色
-                if not Players:GetPlayerFromCharacter(model) then
-                    local baseKey = "NPC: " .. model.Name
-                    local finalKey = baseKey
-                    local i = 1
-                    while newByKey[finalKey] do
-                        i = i + 1
-                        finalKey = baseKey .. " #" .. i
+        local queue = { workspace }
+        local head  = 1
+
+        while head <= #queue and count < NPC_MAX do
+            iter = iter + 1
+            if iter % 60 == 0 then
+                task.wait()   -- 分批让出，避免长卡
+            end
+
+            local parent = queue[head]
+            head = head + 1
+            if parent and parent.Parent then
+                local children = parent:GetChildren()
+                for _, obj in ipairs(children) do
+                    if count >= NPC_MAX then break end
+
+                    if obj:IsA("Humanoid") and obj.Health > 0 then
+                        local model = obj.Parent
+                        if model and model:IsA("Model") and not seen[model] then
+                            seen[model] = true
+                            if not Players:GetPlayerFromCharacter(model) then
+                                local baseKey  = "NPC: " .. model.Name
+                                local finalKey = baseKey
+                                local i = 1
+                                while newByKey[finalKey] do
+                                    i = i + 1
+                                    finalKey = baseKey .. " #" .. i
+                                end
+                                local entry = { model = model, humanoid = obj, key = finalKey }
+                                table.insert(newList, entry)
+                                newByKey[finalKey] = entry
+                                count = count + 1
+                            end
+                        end
+                    elseif obj:IsA("Model") or obj:IsA("Folder") then
+                        table.insert(queue, obj)
                     end
-                    local entry = { model = model, humanoid = obj, key = finalKey }
-                    table.insert(newList, entry)
-                    newByKey[finalKey] = entry
-                    count = count + 1
                 end
             end
         end
-    end
 
-    npcList  = newList
-    npcByKey = newByKey
+        npcList  = newList
+        npcByKey = newByKey
+        if onDone then onDone() end
+    end)
 end
 
--- 指定目标（玩家 / NPC）
 local function getSelectedTarget()
     if AIM_Selected == AIM_TARGET_AUTO then return nil end
 
-    -- 玩家
     local plr = Players:FindFirstChild(AIM_Selected)
     if plr and plr:IsA("Player") then
         local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
@@ -361,19 +438,17 @@ local function getSelectedTarget()
         return nil
     end
 
-    -- NPC
     local entry = npcByKey[AIM_Selected]
     if entry and entry.model and entry.model.Parent then
         local hum = entry.humanoid
         local tgt = getPartFromChar(entry.model)
         if tgt and hum and hum.Health > 0 then
-            return entry.model, tgt     -- key 用 model
+            return entry.model, tgt
         end
     end
     return nil
 end
 
--- [NEW] 返回 (key, part)，key 用于速度追踪
 local function findAimTarget()
     local pickedKey, pickedPart = getSelectedTarget()
     if pickedPart then return pickedKey, pickedPart end
@@ -387,7 +462,6 @@ local function findAimTarget()
     local bestKey, bestPart, bestScore = nil, nil, math.huge
     local camPos = camera.CFrame.Position
 
-    -- 玩家
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= player and plr.Character then
             local hum = plr.Character:FindFirstChildOfClass("Humanoid")
@@ -409,7 +483,6 @@ local function findAimTarget()
         end
     end
 
-    -- NPC（若开启）
     if AIM_LockNPC then
         for _, entry in ipairs(npcList) do
             local model = entry.model
@@ -437,7 +510,7 @@ local function findAimTarget()
     return bestKey, bestPart
 end
 
--- 目标速度追踪（key 可以是 Player 或 Model）
+-- 目标位置平滑 + 速度预测
 local trackData = setmetatable({}, { __mode = "k" })
 
 local function getAimPosition(key, part)
@@ -446,9 +519,10 @@ local function getAimPosition(key, part)
 
     if not data then
         trackData[key] = {
-            lastPos  = part.Position,
-            velocity = Vector3.zero,
-            lastTime = now,
+            lastPos   = part.Position,
+            velocity  = Vector3.zero,
+            smoothPos = part.Position,
+            lastTime  = now,
         }
         return part.Position
     end
@@ -461,13 +535,15 @@ local function getAimPosition(key, part)
         data.lastTime = now
     end
 
+    -- [FIX] 位置低通滤波，抑制抖动传给相机
+    data.smoothPos = data.smoothPos:Lerp(part.Position, 0.5)
+
     if AIM.Prediction <= 0 then
-        return part.Position
+        return data.smoothPos
     end
-    return part.Position + data.velocity * AIM.Prediction
+    return data.smoothPos + data.velocity * AIM.Prediction
 end
 
--- 滚轮调自瞄相机距离
 UserInputService.InputChanged:Connect(function(input)
     if not State.Aimbot then return end
     if input.UserInputType == Enum.UserInputType.MouseWheel then
@@ -490,10 +566,7 @@ local Window = WindUI:CreateWindow({
     Size = UDim2.fromOffset(580, 460),
     Transparent = true,
     Theme = "Dark",
-    User = {
-        Enabled = true,
-        Callback = function() end,
-    },
+    User = { Enabled = true, Callback = function() end },
     SideBarWidth = 180,
     HasOutline = true,
 })
@@ -514,7 +587,7 @@ MainTab:Section({ Title = "玩家属性", Opened = true })
 
 MainTab:Slider({
     Title = "移动速度",
-    Desc = "调整 WalkSpeed",
+    Desc  = "调整 WalkSpeed",
     Value = { Min = 8, Max = 300, Default = State.Speed },
     Step = 1,
     Callback = function(v)
@@ -526,7 +599,7 @@ MainTab:Slider({
 
 MainTab:Slider({
     Title = "跳跃高度",
-    Desc = "调整 JumpPower",
+    Desc  = "调整 JumpPower",
     Value = { Min = 30, Max = 500, Default = State.Jump },
     Step = 1,
     Callback = function(v)
@@ -543,7 +616,7 @@ MainTab:Section({ Title = "视觉效果", Opened = true })
 
 MainTab:Toggle({
     Title = "夜视",
-    Desc = "提亮场景、去雾",
+    Desc  = "提亮场景、去雾",
     Value = false,
     Callback = function(v)
         State.NightVision = v
@@ -553,7 +626,7 @@ MainTab:Toggle({
 
 MainTab:Toggle({
     Title = "ESP 透视",
-    Desc = "高亮其他玩家（隔墙可见）",
+    Desc  = "高亮其他玩家（隔墙可见）",
     Value = false,
     Callback = function(v)
         State.ESP = v
@@ -562,7 +635,7 @@ MainTab:Toggle({
 })
 
 --============================================================
--- 战斗（自瞄）
+-- 战斗
 --============================================================
 MainTab:Section({ Title = "战斗", Opened = true })
 
@@ -591,9 +664,7 @@ MainTab:Slider({
     Desc  = "相机离角色的距离（也可以用滚轮调）",
     Value = { Min = AIM.CamMinDistance, Max = AIM.CamMaxDistance, Default = AIM.CamDistance },
     Step = 1,
-    Callback = function(v)
-        AIM.CamDistance = v
-    end,
+    Callback = function(v) AIM.CamDistance = v end,
 })
 
 MainTab:Slider({
@@ -601,9 +672,7 @@ MainTab:Slider({
     Desc  = "越大相机跟得越快，越小越丝滑",
     Value = { Min = 1, Max = 30, Default = AIM.Smooth },
     Step = 1,
-    Callback = function(v)
-        AIM.Smooth = v
-    end,
+    Callback = function(v) AIM.Smooth = v end,
 })
 
 MainTab:Slider({
@@ -611,31 +680,23 @@ MainTab:Slider({
     Desc  = "预测目标移动的提前量（秒），0 = 不预测；打移动靶调大",
     Value = { Min = 0, Max = 1, Default = AIM.Prediction },
     Step = 0.05,
-    Callback = function(v)
-        AIM.Prediction = v
-    end,
+    Callback = function(v) AIM.Prediction = v end,
 })
 
--- [NEW] 自动锁 NPC 开关
 MainTab:Toggle({
     Title = "自动锁定 NPC",
     Desc  = "开启后「自动」模式也会锁 NPC；关闭只锁玩家",
     Value = true,
-    Callback = function(v)
-        AIM_LockNPC = v
-    end,
+    Callback = function(v) AIM_LockNPC = v end,
 })
 
--- 目标列表
 local function getTargetList()
     local list = { AIM_TARGET_AUTO }
-    -- 玩家
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= player then
             table.insert(list, plr.Name)
         end
     end
-    -- NPC
     for _, entry in ipairs(npcList) do
         table.insert(list, entry.key)
     end
@@ -657,6 +718,7 @@ end
 
 local lastDropdownValue = AIM_TARGET_AUTO
 local suppressNotify    = false
+local lastTargetListCache = nil
 
 local PlayerDropdown = MainTab:Dropdown({
     Title  = "选择自瞄目标",
@@ -668,7 +730,6 @@ local PlayerDropdown = MainTab:Dropdown({
         if suppressNotify then return end
         if v == lastDropdownValue then return end
         lastDropdownValue = v
-
         WindUI:Notify({
             Title    = "自瞄目标",
             Content  = (v == AIM_TARGET_AUTO) and "已切换为自动锁定" or ("已锁定：" .. v),
@@ -691,20 +752,20 @@ local function safeSetDropdown(value)
     task.defer(function() suppressNotify = false end)
 end
 
-local function safeSetDropdown(value)
-    lastDropdownValue = value
-    suppressNotify = true
-    pcall(function() PlayerDropdown:Set(value) end)
-    task.defer(function() suppressNotify = false end)
+local function refreshIfChanged()
+    local cur = getTargetList()
+    if lastTargetListCache and listEqual(lastTargetListCache, cur) then return end
+    lastTargetListCache = cur
+    safeRefreshDropdown()
 end
 
 Players.PlayerAdded:Connect(function(plr)
     task.wait(0.1)
-    safeRefreshDropdown()
+    refreshIfChanged()
     plr.CharacterAdded:Connect(function()
         if State.ESP then refreshESP() end
         task.wait(0.1)
-        safeRefreshDropdown()
+        refreshIfChanged()
     end)
 end)
 
@@ -715,7 +776,7 @@ Players.PlayerRemoving:Connect(function(plr)
         AIM_Selected = AIM_TARGET_AUTO
         safeSetDropdown(AIM_TARGET_AUTO)
     end
-    safeRefreshDropdown()
+    refreshIfChanged()
 end)
 
 --============================================================
@@ -725,20 +786,24 @@ MainTab:Section({ Title = "移动 / 隐身", Opened = true })
 
 MainTab:Toggle({
     Title = "穿墙",
-    Desc = "关闭角色部件碰撞",
+    Desc  = "关闭角色部件碰撞",
     Value = false,
-    Callback = function(v)
-        setNoclip(v)
-    end,
+    Callback = function(v) setNoclip(v) end,
+})
+
+-- [NEW] 人物无碰撞
+MainTab:Toggle({
+    Title = "人物无碰撞",
+    Desc  = "无碰撞",
+    Value = false,
+    Callback = function(v) setNoPlayerCollide(v) end,
 })
 
 MainTab:Toggle({
     Title = "隐身",
-    Desc = "别人看不到你（需服务端支持 UL_Stealth）",
+    Desc  = "别人看不到你（需服务端支持 UL_Stealth）",
     Value = false,
-    Callback = function(v)
-        setStealth(v)
-    end,
+    Callback = function(v) setStealth(v) end,
 })
 
 --============================================================
@@ -750,7 +815,7 @@ SettingsTab:Section({ Title = "主题", Opened = true })
 
 SettingsTab:Dropdown({
     Title = "主题色",
-    Desc = "选择整个界面的主题",
+    Desc  = "选择整个界面的主题",
     Values = {
         "Dark", "Light", "Rose", "Plant", "Red",
         "Indigo", "Sky", "Violet", "Amber", "Emerald",
@@ -781,7 +846,7 @@ SettingsTab:Section({ Title = "自瞄高级参数", Opened = false })
 
 SettingsTab:Slider({
     Title = "屏幕范围",
-    Desc = "屏幕中心命中半径",
+    Desc  = "屏幕中心命中半径",
     Value = { Min = 50, Max = 600, Default = AIM.ConeRadius },
     Step = 10,
     Callback = function(v) AIM.ConeRadius = v end,
@@ -789,7 +854,7 @@ SettingsTab:Slider({
 
 SettingsTab:Slider({
     Title = "最大锁定距离",
-    Desc = "世界坐标最大锁定距离",
+    Desc  = "世界坐标最大锁定距离",
     Value = { Min = 50, Max = 800, Default = AIM.MaxDistance },
     Step = 10,
     Callback = function(v) AIM.MaxDistance = v end,
@@ -797,7 +862,7 @@ SettingsTab:Slider({
 
 SettingsTab:Slider({
     Title = "相机最近距离",
-    Desc = "自瞄相机能贴多近",
+    Desc  = "自瞄相机能贴多近",
     Value = { Min = 1, Max = 20, Default = AIM.CamMinDistance },
     Step = 0.5,
     Callback = function(v)
@@ -808,7 +873,7 @@ SettingsTab:Slider({
 
 SettingsTab:Slider({
     Title = "相机最远距离",
-    Desc = "自瞄相机能拉多远",
+    Desc  = "自瞄相机能拉多远",
     Value = { Min = 20, Max = 800, Default = AIM.CamMaxDistance },
     Step = 10,
     Callback = function(v)
@@ -820,7 +885,7 @@ SettingsTab:Slider({
 SettingsTab:Section({ Title = "ESP 颜色", Opened = false })
 
 SettingsTab:Colorpicker({
-    Title = "高亮颜色",
+    Title   = "高亮颜色",
     Default = espColor,
     Callback = function(color)
         espColor = color
@@ -876,6 +941,11 @@ local function onCharacter(char)
         if stealthConn then stealthConn:Disconnect() end
         stealthConn = RunService.Stepped:Connect(applyStealthLocalTick)
     end
+
+    if State.NoPlayerCollide then
+        task.wait(0.1)
+        setCharGroup(char, SELF_GROUP)
+    end
 end
 
 if player.Character then onCharacter(player.Character) end
@@ -884,25 +954,9 @@ player.CharacterAdded:Connect(onCharacter)
 --============================================================
 -- 循环
 --============================================================
-local espClock    = 0
-local npcScanClock = 0
-
-RunService.Heartbeat:Connect(function(dt)
-    -- NPC 扫描（每 1.5 秒一次）
-    npcScanClock = npcScanClock + dt
-    if npcScanClock >= 1.5 then
-        npcScanClock = 0
-        local oldList = getTargetList()
-        scanNPCs()
-        local newList = getTargetList()
-        if not listEqual(oldList, newList) then
-            safeRefreshDropdown()
-        end
-    end
-end)
+local espClock = 0
 
 RunService.RenderStepped:Connect(function(dt)
-    -- ESP 定时刷新
     if State.ESP then
         espClock = espClock + dt
         if espClock >= 0.4 then
@@ -911,7 +965,6 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- 自瞄
     if State.Aimbot then
         local char = player.Character
         local head = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
@@ -937,15 +990,20 @@ RunService.RenderStepped:Connect(function(dt)
 
             local camPos = focusPos - dir * AIM.CamDistance
             local desired = CFrame.lookAt(camPos, lookAt)
-            local alpha = math.clamp(dt * AIM.Smooth, 0, 1)
+            -- [FIX] alpha 上限，避免帧率不稳时跳变
+            local alpha = math.clamp(dt * AIM.Smooth, 0, 0.35)
             camera.CFrame = camera.CFrame:Lerp(desired, alpha)
         end
     end
 end)
 
--- 启动时先扫一次 NPC
+-- NPC 扫描循环（异步，不卡主线程）
 task.spawn(function()
     task.wait(1)
-    scanNPCs()
-    safeRefreshDropdown()
+    while true do
+        scanNPCsAsync(function()
+            refreshIfChanged()
+        end)
+        task.wait(1.5)
+    end
 end)
